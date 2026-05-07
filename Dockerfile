@@ -66,7 +66,8 @@ RUN sed -i \
 # App
 # ----------------------------
 WORKDIR /var/www/html
-COPY webroot/*.php .
+COPY webroot/index.php .
+COPY webroot/rescan.php .
 COPY webroot/.htaccess .
 
 RUN chown -R apache:apache /var/www/html
