@@ -1,4 +1,4 @@
-# chocopkg
+# MUFFIN • Minimal Unified Feed For Indexed NuGet
 
 A self-hosted [Chocolatey](https://chocolatey.org/) / NuGet v2 package repository.  
 Drop `.nupkg` files into `webroot/packages/`, run the container, point Chocolatey at it.
