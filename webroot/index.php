@@ -1,59 +1,105 @@
 <?php
 /**
- * Simple NuGet v2 OData endpoint for Chocolatey
- * Place this as index.php and configure PACKAGES_DIR below.
+ * NuGet v2 OData endpoint — Chocolatey-compatible private repository
+ *
+ * Drop .nupkg files into ./packages/ then hit /rescan.php (or scan.sh)
+ * to rebuild the index. All reads use the cached index.json for speed.
  */
 
+declare (strict_types = 1);
+
 define("PACKAGES_DIR", __DIR__ . "/packages");
-define(
-    "BASE_URL",
-    "http" . (isset($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] === "on" ? "s" : "") . "://" . $_SERVER["HTTP_HOST"],
-);
+define("INDEX_FILE", PACKAGES_DIR . "/index.json");
+
+$scheme = (isset($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] === "on") ? "https" : "http";
+define("BASE_URL", $scheme . "://" . $_SERVER["HTTP_HOST"]);
+
+// ── Router ────────────────────────────────────────────────────────────────────
+
+$uri      = parse_url($_SERVER["REQUEST_URI"] ?? "/", PHP_URL_PATH);
+$path     = trim($uri, "/");
+$segments = $path === "" ? [] : explode("/", $path);
+$endpoint = $segments[0] ?? "";
 
 header("Content-Type: application/atom+xml; charset=utf-8");
 
-$path = trim(parse_url($_SERVER["REQUEST_URI"], PHP_URL_PATH), "/");
-$segments = explode("/", $path);
-
-$endpoint = $segments[0] ?? "";
-
-switch ($endpoint) {
-    case "":
-    case '$metadata':
+switch (true) {
+    case $endpoint === "" || $endpoint === '$metadata':
         serve_metadata();
         break;
 
-    case "Packages":
+    case $endpoint === "Packages" && isset($segments[1]) && $segments[1] === '$count':
+        serve_count();
+        break;
+
+    case $endpoint === "Packages":
         serve_packages();
         break;
 
-    case "FindPackagesById()":
-    case "FindPackagesById":
-        $id = $_GET["id"] ?? ($_GET["Id"] ?? "");
-        $id = trim($id, "'\"");
+    case in_array($endpoint, ["FindPackagesById()", "FindPackagesById"], true):
+        $id = trim($_GET["id"] ?? ($_GET["Id"] ?? ""), "'\"");
         serve_packages($id);
         break;
 
-    case "GetUpdates()":
-    case "GetUpdates":
+    case in_array($endpoint, ["Search()", "Search"], true):
+        serve_search();
+        break;
+
+    case in_array($endpoint, ["GetUpdates()", "GetUpdates"], true):
         serve_get_updates();
         break;
 
-    case "package":
-        // Download: /package/{id}/{version}
-        $pkgId = $segments[1] ?? "";
-        $pkgVersion = $segments[2] ?? "";
-        serve_download($pkgId, $pkgVersion);
+    case $endpoint === "package":
+        serve_download($segments[1] ?? "", $segments[2] ?? "");
         break;
 
     default:
         http_response_code(404);
+        header("Content-Type: application/xml; charset=utf-8");
         echo '<?xml version="1.0"?><error>Not found</error>';
 }
 
-// ─────────────────────────────────────────────
-// Parse a .nupkg file and extract metadata from the .nuspec inside
-// ─────────────────────────────────────────────
+// ── Index helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Load the cached index built by rescan.php.
+ * Falls back to live scan if index.json is missing.
+ */
+function load_index(): array
+{
+    if (file_exists(INDEX_FILE)) {
+        $data = json_decode(file_get_contents(INDEX_FILE), true);
+        if (is_array($data)) {
+            return $data;
+        }
+    }
+    // fallback: live scan (slow but safe)
+    return live_scan();
+}
+
+function live_scan(): array
+{
+    $index = [];
+    if (! is_dir(PACKAGES_DIR)) {
+        return $index;
+    }
+    foreach (glob(PACKAGES_DIR . "/*.nupkg") as $file) {
+        $pkg = parse_nupkg($file);
+        if ($pkg) {
+            $index[] = $pkg + [
+                "file"    => basename($file),
+                "updated" => filemtime($file),
+                "size"    => filesize($file),
+            ];
+        }
+    }
+    usort($index, fn($a, $b) => strcmp($a["id"] . $a["version"], $b["id"] . $b["version"]));
+    return $index;
+}
+
+/**
+ * Parse a .nupkg and return its metadata.
+ */
 function parse_nupkg(string $filepath): ?array
 {
     $zip = new ZipArchive();
@@ -71,258 +117,382 @@ function parse_nupkg(string $filepath): ?array
     }
     $zip->close();
 
-    if (!$nuspec) {
+    if (! $nuspec) {
         return null;
     }
 
     $xml = @simplexml_load_string($nuspec);
-    if (!$xml) {
+    if (! $xml) {
         return null;
     }
 
     $m = $xml->metadata;
+
+    // SHA512 checksum for NuGet compliance
+    $hash = base64_encode(hash_file("sha512", $filepath, true));
+
     return [
-        "id" => (string) ($m->id ?? ""),
-        "version" => (string) ($m->version ?? ""),
-        "title" => (string) ($m->title ?? ($m->id ?? "")),
-        "summary" => (string) ($m->summary ?? ($m->description ?? "")),
-        "description" => (string) ($m->description ?? ""),
-        "authors" => (string) ($m->authors ?? ""),
-        "tags" => (string) ($m->tags ?? ""),
-        "projectUrl" => (string) ($m->projectUrl ?? ""),
-        "licenseUrl" => (string) ($m->licenseUrl ?? ""),
-        "iconUrl" => (string) ($m->iconUrl ?? ""),
+        "id"                       => (string) ($m->id ?? ""),
+        "version"                  => (string) ($m->version ?? ""),
+        "title"                    => (string) ($m->title ?? ($m->id ?? "")),
+        "summary"                  => (string) ($m->summary ?? ($m->description ?? "")),
+        "description"              => (string) ($m->description ?? ""),
+        "authors"                  => (string) ($m->authors ?? ""),
+        "owners"                   => (string) ($m->owners ?? ($m->authors ?? "")),
+        "tags"                     => (string) ($m->tags ?? ""),
+        "projectUrl"               => (string) ($m->projectUrl ?? ""),
+        "licenseUrl"               => (string) ($m->licenseUrl ?? ""),
+        "iconUrl"                  => (string) ($m->iconUrl ?? ""),
+        "releaseNotes"             => (string) ($m->releaseNotes ?? ""),
         "requireLicenseAcceptance" => strtolower((string) ($m->requireLicenseAcceptance ?? "false")),
-        "dependencies" => parse_dependencies($m->dependencies ?? null),
-        "published" => date("c", filemtime($filepath)),
-        "size" => filesize($filepath),
-        "filename" => basename($filepath),
+        "dependencies"             => parse_dependencies($m->dependencies ?? null),
+        "published"                => date("c", filemtime($filepath)),
+        "size"                     => filesize($filepath),
+        "hash"                     => $hash,
+        "hashAlgorithm"            => "SHA512",
+        "filename"                 => basename($filepath),
     ];
 }
 
 function parse_dependencies($deps): string
 {
-    if (!$deps) {
+    if (! $deps) {
         return "";
     }
     $out = [];
     foreach ($deps->dependency ?? [] as $dep) {
-        $id = (string) ($dep["id"] ?? "");
-        $ver = (string) ($dep["version"] ?? "");
-        $out[] = $id . ($ver ? ":" . $ver . ":" : "::");
+        $id    = (string) ($dep["id"] ?? "");
+        $ver   = (string) ($dep["version"] ?? "");
+        $out[] = $id . ":" . $ver . ":";
     }
-    // Also handle <group> elements
     foreach ($deps->group ?? [] as $group) {
+        $tf = (string) ($group["targetFramework"] ?? "");
         foreach ($group->dependency ?? [] as $dep) {
-            $id = (string) ($dep["id"] ?? "");
-            $ver = (string) ($dep["version"] ?? "");
-            $out[] = $id . ($ver ? ":" . $ver . ":" : "::");
+            $id    = (string) ($dep["id"] ?? "");
+            $ver   = (string) ($dep["version"] ?? "");
+            $out[] = $id . ":" . $ver . ":" . $tf;
         }
     }
     return implode("|", $out);
 }
 
-// ─────────────────────────────────────────────
-// Scan packages dir and return all parsed packages (optionally filtered by id)
-// ─────────────────────────────────────────────
-function get_packages(string $filterId = ""): array
+// ── OData filter / query helpers ──────────────────────────────────────────────
+
+/**
+ * Apply OData $filter string to the full index and return matching packages.
+ */
+function apply_filter(array $packages, string $filter): array
 {
-    $dir = PACKAGES_DIR;
-    $packages = [];
-
-    if (!is_dir($dir)) {
-        return $packages;
+    // Id eq 'X'
+    if (preg_match("/\bId\s+eq\s+'([^']+)'/i", $filter, $m)) {
+        $want = $m[1];
+        return array_values(array_filter($packages, fn($p) => strcasecmp($p["id"], $want) === 0));
     }
-
-    foreach (glob($dir . "/*.nupkg") as $file) {
-        $pkg = parse_nupkg($file);
-        if (!$pkg) {
-            continue;
-        }
-        if ($filterId && strcasecmp($pkg["id"], $filterId) !== 0) {
-            continue;
-        }
-        $packages[] = $pkg;
+    // tolower(Id) eq 'x'
+    if (preg_match("/tolower\s*\(\s*Id\s*\)\s+eq\s+'([^']+)'/i", $filter, $m)) {
+        $want = strtolower($m[1]);
+        return array_values(array_filter($packages, fn($p) => strtolower($p["id"]) === $want));
     }
-
-    // Sort by id then version
-    usort($packages, fn($a, $b) => strcmp($a["id"] . $a["version"], $b["id"] . $b["version"]));
-
+    // substringof('term', tolower(Id)) or substringof('term', Id)
+    if (preg_match("/substringof\s*\(\s*'([^']+)'\s*,\s*(?:tolower\s*\(\s*)?Id(?:\s*\))?\s*\)/i", $filter, $m)) {
+        $term = strtolower($m[1]);
+        return array_values(array_filter($packages, fn($p) =>
+            str_contains(strtolower($p["id"]), $term) ||
+            str_contains(strtolower($p["title"]), $term) ||
+            str_contains(strtolower($p["tags"]), $term)
+        ));
+    }
+    // Version eq 'X'
+    if (preg_match("/\bVersion\s+eq\s+'([^']+)'/i", $filter, $m)) {
+        $want = $m[1];
+        return array_values(array_filter($packages, fn($p) => $p["version"] === $want));
+    }
     return $packages;
 }
 
-// ─────────────────────────────────────────────
-// Render an Atom <entry> for a package
-// ─────────────────────────────────────────────
-function package_entry(array $pkg): string
+/**
+ * Apply OData $orderby.
+ */
+function apply_orderby(array $packages, string $orderby): array
 {
-    $base = BASE_URL;
-    $id = htmlspecialchars($pkg["id"]);
-    $version = htmlspecialchars($pkg["version"]);
-    $title = htmlspecialchars($pkg["title"]);
-    $summary = htmlspecialchars($pkg["summary"]);
-    $desc = htmlspecialchars($pkg["description"]);
-    $authors = htmlspecialchars($pkg["authors"]);
-    $tags = htmlspecialchars($pkg["tags"]);
-    $projUrl = htmlspecialchars($pkg["projectUrl"]);
-    $licUrl = htmlspecialchars($pkg["licenseUrl"]);
-    $iconUrl = htmlspecialchars($pkg["iconUrl"]);
-    $rla = $pkg["requireLicenseAcceptance"];
-    $pub = $pkg["published"];
-    $size = $pkg["size"];
-    $deps = htmlspecialchars($pkg["dependencies"]);
-    $dlUrl = "{$base}/package/{$id}/{$version}";
+    $parts = preg_split('/\s+/', trim($orderby));
+    $field = strtolower($parts[0] ?? "id");
+    $desc  = strtolower($parts[1] ?? "") === "desc";
 
-    return <<<XML
-      <entry>
-        <id>{$base}/Packages(Id='{$id}',Version='{$version}')</id>
-        <title type="text">{$title}</title>
-        <summary type="text">{$summary}</summary>
-        <updated>{$pub}</updated>
-        <author><name>{$authors}</name></author>
-        <link rel="edit-media" title="Package" href="Packages(Id='{$id}',Version='{$version}')/\$value" />
-        <link rel="edit" title="Package" href="Packages(Id='{$id}',Version='{$version}')" />
-        <content type="application/zip" src="{$dlUrl}" />
-        <m:properties xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
-                      xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
-          <d:Id>{$id}</d:Id>
-          <d:Version>{$version}</d:Version>
-          <d:Title>{$title}</d:Title>
-          <d:Description>{$desc}</d:Description>
-          <d:Summary>{$summary}</d:Summary>
-          <d:Authors>{$authors}</d:Authors>
-          <d:Tags>{$tags}</d:Tags>
-          <d:ProjectUrl>{$projUrl}</d:ProjectUrl>
-          <d:LicenseUrl>{$licUrl}</d:LicenseUrl>
-          <d:IconUrl>{$iconUrl}</d:IconUrl>
-          <d:RequireLicenseAcceptance m:type="Edm.Boolean">{$rla}</d:RequireLicenseAcceptance>
-          <d:Dependencies>{$deps}</d:Dependencies>
-          <d:PackageSize m:type="Edm.Int64">{$size}</d:PackageSize>
-          <d:Published m:type="Edm.DateTime">{$pub}</d:Published>
-          <d:IsLatestVersion m:type="Edm.Boolean">true</d:IsLatestVersion>
-          <d:IsAbsoluteLatestVersion m:type="Edm.Boolean">true</d:IsAbsoluteLatestVersion>
-          <d:Listed m:type="Edm.Boolean">true</d:Listed>
-          <d:DownloadCount m:type="Edm.Int32">0</d:DownloadCount>
-        </m:properties>
-      </entry>
-    XML;
+    usort($packages, function ($a, $b) use ($field, $desc) {
+        $va = strtolower((string) ($a[$field] ?? ""));
+        $vb = strtolower((string) ($b[$field] ?? ""));
+        return $desc ? strcmp($vb, $va) : strcmp($va, $vb);
+    });
+    return $packages;
 }
 
-// ─────────────────────────────────────────────
-// Endpoints
-// ─────────────────────────────────────────────
-function serve_metadata(): void
+/**
+ * Parse and apply all relevant OData query params.
+ * Returns [$slice, $total].
+ */
+function apply_odata(array $packages): array
 {
-    // Minimal $metadata response sufficient for Chocolatey
-    header("Content-Type: application/xml; charset=utf-8");
-    echo <<<XML
-    <?xml version="1.0" encoding="utf-8"?>
-    <service xmlns="http://www.w3.org/2007/app" xmlns:atom="http://www.w3.org/2005/Atom" xml:base="
-    XML;
-    echo BASE_URL . '">';
-    echo <<<XML
+    if (isset($_GET['$filter'])) {
+        $packages = apply_filter($packages, $_GET['$filter']);
+    }
 
-      <workspace>
-        <atom:title>Default</atom:title>
-        <collection href="Packages">
-          <atom:title>Packages</atom:title>
-        </collection>
-      </workspace>
-    </service>
-    XML;
-}
-
-function serve_packages(string $filterId = ""): void
-{
-    // Support OData $filter parsing for Chocolatey search
-    if (!$filterId && isset($_GET['$filter'])) {
-        $filter = $_GET['$filter'];
-        if (preg_match("/Id\s+eq\s+'([^']+)'/i", $filter, $m)) {
-            $filterId = $m[1];
-        } elseif (preg_match("/tolower\(Id\)\s+eq\s+'([^']+)'/i", $filter, $m)) {
-            $filterId = $m[1];
+    // searchTerm support (Search() endpoint)
+    if (isset($_GET['searchTerm'])) {
+        $term = strtolower(trim($_GET['searchTerm'], "'\" "));
+        if ($term !== "") {
+            $packages = array_values(array_filter($packages, fn($p) =>
+                str_contains(strtolower($p["id"]), $term) ||
+                str_contains(strtolower($p["title"]), $term) ||
+                str_contains(strtolower($p["description"]), $term) ||
+                str_contains(strtolower($p["tags"]), $term)
+            ));
         }
     }
 
-    $packages = get_packages($filterId);
-    $base = BASE_URL;
-    $updated = date("c");
-    $count = count($packages);
+    // targetFramework / includePrerelease — accepted, ignored (all packages served)
 
-    echo <<<XML
-    <?xml version="1.0" encoding="utf-8"?>
-    <feed xmlns="http://www.w3.org/2005/Atom"
-          xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
-          xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
-          xml:base="{$base}">
-      <title type="text">Packages</title>
-      <id>{$base}/Packages</id>
-      <updated>{$updated}</updated>
-      <link rel="self" title="Packages" href="Packages" />
-      <m:count>{$count}</m:count>
+    $total = count($packages);
 
-    XML;
-
-    foreach ($packages as $pkg) {
-        echo package_entry($pkg) . "\n";
+    if (isset($_GET['$orderby'])) {
+        $packages = apply_orderby($packages, $_GET['$orderby']);
     }
 
-    echo "</feed>";
+    $skip = max(0, (int) ($_GET['$skip'] ?? 0));
+    $top  = isset($_GET['$top']) ? max(1, (int) $_GET['$top']) : null;
+
+    $packages = array_slice($packages, $skip);
+    if ($top !== null) {
+        $packages = array_slice($packages, 0, $top);
+    }
+
+    return [$packages, $total];
 }
 
-function serve_get_updates(): void
+// ── Atom entry renderer ───────────────────────────────────────────────────────
+
+function package_entry(array $pkg): string
 {
-    // Chocolatey calls GetUpdates() to check for newer versions.
-    // We return an empty feed — clients will find packages via FindPackagesById.
-    $base = BASE_URL;
+    $base    = BASE_URL;
+    $id      = htmlspecialchars($pkg["id"], ENT_XML1);
+    $ver     = htmlspecialchars($pkg["version"], ENT_XML1);
+    $title   = htmlspecialchars($pkg["title"], ENT_XML1);
+    $summary = htmlspecialchars($pkg["summary"], ENT_XML1);
+    $desc    = htmlspecialchars($pkg["description"] ?? $pkg["summary"], ENT_XML1);
+    $authors = htmlspecialchars($pkg["authors"] ?? "", ENT_XML1);
+    $owners  = htmlspecialchars($pkg["owners"] ?? $pkg["authors"] ?? "", ENT_XML1);
+    $tags    = htmlspecialchars($pkg["tags"] ?? "", ENT_XML1);
+    $projUrl = htmlspecialchars($pkg["projectUrl"] ?? "", ENT_XML1);
+    $licUrl  = htmlspecialchars($pkg["licenseUrl"] ?? "", ENT_XML1);
+    $iconUrl = htmlspecialchars($pkg["iconUrl"] ?? "", ENT_XML1);
+    $notes   = htmlspecialchars($pkg["releaseNotes"] ?? "", ENT_XML1);
+    $rla     = $pkg["requireLicenseAcceptance"] ?? "false";
+    $pub     = $pkg["published"] ?? date("c");
+    $size    = (int) ($pkg["size"] ?? 0);
+    $deps    = htmlspecialchars($pkg["dependencies"] ?? "", ENT_XML1);
+    $hash    = htmlspecialchars($pkg["hash"] ?? "", ENT_XML1);
+    $hashAlg = htmlspecialchars($pkg["hashAlgorithm"] ?? "SHA512", ENT_XML1);
+    $dlUrl   = "{$base}/package/{$id}/{$ver}";
+
+    return <<<XML
+  <entry>
+    <id>{$base}/Packages(Id='{$id}',Version='{$ver}')</id>
+    <title type="text">{$title}</title>
+    <summary type="text">{$summary}</summary>
+    <updated>{$pub}</updated>
+    <author><name>{$authors}</name></author>
+    <link rel="edit-media" title="Package" href="Packages(Id='{$id}',Version='{$ver}')/\$value"/>
+    <link rel="edit"       title="Package" href="Packages(Id='{$id}',Version='{$ver}')"/>
+    <content type="application/zip" src="{$dlUrl}"/>
+    <m:properties>
+      <d:Id>{$id}</d:Id>
+      <d:Version>{$ver}</d:Version>
+      <d:Title>{$title}</d:Title>
+      <d:Description>{$desc}</d:Description>
+      <d:Summary>{$summary}</d:Summary>
+      <d:ReleaseNotes>{$notes}</d:ReleaseNotes>
+      <d:Authors>{$authors}</d:Authors>
+      <d:Owners>{$owners}</d:Owners>
+      <d:Tags>{$tags}</d:Tags>
+      <d:ProjectUrl>{$projUrl}</d:ProjectUrl>
+      <d:LicenseUrl>{$licUrl}</d:LicenseUrl>
+      <d:IconUrl>{$iconUrl}</d:IconUrl>
+      <d:RequireLicenseAcceptance m:type="Edm.Boolean">{$rla}</d:RequireLicenseAcceptance>
+      <d:Dependencies>{$deps}</d:Dependencies>
+      <d:PackageSize m:type="Edm.Int64">{$size}</d:PackageSize>
+      <d:PackageHash>{$hash}</d:PackageHash>
+      <d:PackageHashAlgorithm>{$hashAlg}</d:PackageHashAlgorithm>
+      <d:Published m:type="Edm.DateTime">{$pub}</d:Published>
+      <d:Created m:type="Edm.DateTime">{$pub}</d:Created>
+      <d:LastUpdated m:type="Edm.DateTime">{$pub}</d:LastUpdated>
+      <d:IsLatestVersion m:type="Edm.Boolean">true</d:IsLatestVersion>
+      <d:IsAbsoluteLatestVersion m:type="Edm.Boolean">true</d:IsAbsoluteLatestVersion>
+      <d:IsPrerelease m:type="Edm.Boolean">false</d:IsPrerelease>
+      <d:Listed m:type="Edm.Boolean">true</d:Listed>
+      <d:DownloadCount m:type="Edm.Int32">0</d:DownloadCount>
+      <d:VersionDownloadCount m:type="Edm.Int32">0</d:VersionDownloadCount>
+    </m:properties>
+  </entry>
+XML;
+}
+
+// ── Feed wrapper ──────────────────────────────────────────────────────────────
+
+function feed_open(string $title, int $total): void
+{
+    $base    = BASE_URL;
     $updated = date("c");
     echo <<<XML
-    <?xml version="1.0" encoding="utf-8"?>
-    <feed xmlns="http://www.w3.org/2005/Atom"
-          xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
-          xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
-          xml:base="{$base}">
-      <title type="text">GetUpdates</title>
-      <id>{$base}/GetUpdates</id>
-      <updated>{$updated}</updated>
-      <m:count>0</m:count>
-    </feed>
-    XML;
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
+      xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
+      xml:base="{$base}">
+  <title type="text">{$title}</title>
+  <id>{$base}/{$title}</id>
+  <updated>{$updated}</updated>
+  <link rel="self" title="{$title}" href="{$title}"/>
+  <m:count>{$total}</m:count>
+XML;
+}
+
+function feed_close(): void
+{
+    echo "\n</feed>";
+}
+
+// ── Endpoint handlers ─────────────────────────────────────────────────────────
+
+function serve_metadata(): void
+{
+    header("Content-Type: application/xml; charset=utf-8");
+    $base = BASE_URL;
+    echo <<<XML
+<?xml version="1.0" encoding="utf-8"?>
+<service xmlns="http://www.w3.org/2007/app"
+         xmlns:atom="http://www.w3.org/2005/Atom"
+         xml:base="{$base}">
+  <workspace>
+    <atom:title>Default</atom:title>
+    <collection href="Packages">
+      <atom:title>Packages</atom:title>
+    </collection>
+  </workspace>
+</service>
+XML;
+}
+
+function serve_count(): void
+{
+    header("Content-Type: text/plain; charset=utf-8");
+    $all         = load_index();
+    [$_, $total] = apply_odata($all);
+    echo $total;
+}
+
+function serve_packages(string $fixedId = ""): void
+{
+    $all = load_index();
+
+    if ($fixedId !== "") {
+        $all = array_values(array_filter($all, fn($p) => strcasecmp($p["id"], $fixedId) === 0));
+    }
+
+    [$slice, $total] = apply_odata($all);
+
+    feed_open("Packages", $total);
+    foreach ($slice as $pkg) {
+        echo "\n" . package_entry(enrich($pkg));
+    }
+    feed_close();
+}
+
+function serve_search(): void
+{
+    $all             = load_index();
+    [$slice, $total] = apply_odata($all);
+
+    feed_open("Search", $total);
+    foreach ($slice as $pkg) {
+        echo "\n" . package_entry(enrich($pkg));
+    }
+    feed_close();
+}
+
+/**
+ * GetUpdates() — compare client's installed versions against the index.
+ * Chocolatey sends: packageIds, versions (pipe-delimited), includePrerelease, targetFramework
+ */
+function serve_get_updates(): void
+{
+    $rawIds      = $_GET["packageIds"] ?? $_GET["PackageIds"] ?? "";
+    $rawVersions = $_GET["versions"] ?? $_GET["Versions"] ?? "";
+    $ids         = $rawIds !== "" ? explode("|", $rawIds) : [];
+    $clientVers  = $rawVersions !== "" ? explode("|", $rawVersions) : [];
+
+    $all     = load_index();
+    $updates = [];
+
+    foreach ($ids as $i => $clientId) {
+        $clientId  = trim($clientId);
+        $clientVer = trim($clientVers[$i] ?? "0.0.0");
+
+        // Find the highest version in the index for this id
+        $candidates = array_filter($all, fn($p) => strcasecmp($p["id"], $clientId) === 0);
+        if (empty($candidates)) {
+            continue;
+        }
+        usort($candidates, fn($a, $b) => version_compare($b["version"], $a["version"]));
+        $latest = reset($candidates);
+
+        if (version_compare($latest["version"], $clientVer, ">")) {
+            $updates[] = $latest;
+        }
+    }
+
+    feed_open("GetUpdates", count($updates));
+    foreach ($updates as $pkg) {
+        echo "\n" . package_entry(enrich($pkg));
+    }
+    feed_close();
 }
 
 function serve_download(string $id, string $version): void
 {
-    if (!$id) {
+    if ($id === "") {
         http_response_code(400);
         exit();
     }
 
-    $dir = PACKAGES_DIR;
+    $dir  = PACKAGES_DIR;
     $file = null;
 
-    // Exact filename match first
-    $candidate = $dir . "/" . $id . "." . $version . ".nupkg";
-    if ($version && file_exists($candidate)) {
-        $file = $candidate;
-    } else {
-        // Scan and match by parsed metadata
-        foreach (glob($dir . "/*.nupkg") as $f) {
-            $pkg = parse_nupkg($f);
-            if (!$pkg) {
-                continue;
-            }
-            if (strcasecmp($pkg["id"], $id) !== 0) {
-                continue;
-            }
-            if ($version && $pkg["version"] !== $version) {
-                continue;
-            }
-            $file = $f;
-            break;
+    // Fast path: conventional filename
+    if ($version !== "") {
+        $candidate = $dir . "/" . $id . "." . $version . ".nupkg";
+        if (file_exists($candidate)) {
+            $file = $candidate;
         }
     }
 
-    if (!$file || !file_exists($file)) {
+    // Slow path: scan index
+    if (! $file) {
+        foreach (load_index() as $pkg) {
+            if (strcasecmp($pkg["id"], $id) !== 0) {
+                continue;
+            }
+            if ($version !== "" && $pkg["version"] !== $version) {
+                continue;
+            }
+            $candidate = $dir . "/" . $pkg["file"];
+            if (file_exists($candidate)) {
+                $file = $candidate;
+                break;
+            }
+        }
+    }
+
+    if (! $file || ! file_exists($file)) {
         http_response_code(404);
         exit();
     }
@@ -330,6 +500,28 @@ function serve_download(string $id, string $version): void
     header("Content-Type: application/zip");
     header('Content-Disposition: attachment; filename="' . basename($file) . '"');
     header("Content-Length: " . filesize($file));
+    header("X-Content-Type-Options: nosniff");
     readfile($file);
     exit();
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+/**
+ * Enrich a lean index record with full metadata if needed.
+ * Index records built by rescan.php are minimal; live_scan() returns full records.
+ */
+function enrich(array $pkg): array
+{
+    // If full fields are missing, re-parse the nupkg
+    if (! isset($pkg["description"])) {
+        $path = PACKAGES_DIR . "/" . $pkg["file"];
+        if (file_exists($path)) {
+            $full = parse_nupkg($path);
+            if ($full) {
+                return $full + $pkg;
+            }
+        }
+    }
+    return $pkg;
 }

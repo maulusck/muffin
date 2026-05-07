@@ -29,13 +29,13 @@ RUN echo "ServerName localhost" >> /etc/apache2/httpd.conf
 # Critical fix: permissions + index + no directory listing
 # ----------------------------
 RUN printf '%s\n' \
-'<Directory "/var/www/html">' \
-'    Require all granted' \
-'    AllowOverride All' \
-'    Options -Indexes +FollowSymLinks' \
-'    DirectoryIndex index.php index.html' \
-'</Directory>' \
-> /etc/apache2/conf.d/nuget.conf
+    '<Directory "/var/www/html">' \
+    '    Require all granted' \
+    '    AllowOverride All' \
+    '    Options -Indexes +FollowSymLinks' \
+    '    DirectoryIndex index.php index.html' \
+    '</Directory>' \
+    > /etc/apache2/conf.d/nuget.conf
 
 # ----------------------------
 # PHP-FPM config
@@ -48,10 +48,10 @@ RUN sed -i \
 # PHP handler via Apache proxy_fcgi
 # ----------------------------
 RUN printf '%s\n' \
-'<FilesMatch "\.php$">' \
-'    SetHandler "proxy:fcgi://127.0.0.1:9000"' \
-'</FilesMatch>' \
-> /etc/apache2/conf.d/php.conf
+    '<FilesMatch "\.php$">' \
+    '    SetHandler "proxy:fcgi://127.0.0.1:9000"' \
+    '</FilesMatch>' \
+    > /etc/apache2/conf.d/php.conf
 
 # ----------------------------
 # Enable Apache modules (Alpine-safe)
@@ -66,7 +66,8 @@ RUN sed -i \
 # App
 # ----------------------------
 WORKDIR /var/www/html
-COPY . .
+COPY webroot/*.php .
+COPY webroot/.htaccess .
 
 RUN chown -R apache:apache /var/www/html
 

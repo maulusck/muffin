@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 set -e
-podman exec -lit php82 /var/www/html/rescan.php
+exec podman exec -it websrv php82 /var/www/html/rescan.php
