@@ -67,6 +67,7 @@ RUN sed -i \
 # ----------------------------
 WORKDIR /var/www/html
 COPY webroot/index.php .
+COPY webroot/config.php .
 COPY webroot/rescan.php .
 COPY webroot/.htaccess .
 
