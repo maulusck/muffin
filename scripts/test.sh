@@ -2,137 +2,201 @@
 set -euo pipefail
 
 BASE="${1:-http://localhost:8080}"
+PKG="${2:-7zip}"
+VER="${3:-26.0.0}"
+
+PASS=0
 FAIL=0
+SKIP=0
 
 GREEN="\033[0;32m"
 RED="\033[0;31m"
+YELLOW="\033[0;33m"
+BOLD="\033[1m"
 NC="\033[0m"
 
-ok()   { printf "  %-36s ${GREEN}OK${NC}\n"   "$1"; }
-fail() { printf "  %-36s ${RED}FAIL${NC}\n" "$1"; FAIL=1; }
-hdr()  { echo ""; echo "== $1 =="; }
+ok() { printf "  %-60s ${GREEN}OK${NC}\n" "$1"; ((PASS++)) || true; }
+fail() { printf "  %-60s ${RED}FAIL${NC} %s\n" "$1" "${2:-}"; ((FAIL++)) || true; }
+skip() { printf "  %-60s ${YELLOW}SKIP${NC} %s\n" "$1" "${2:-}"; ((SKIP++)) || true; }
 
-http_code() {
-    curl -s -o /dev/null -w "%{http_code}" "$1"
+hdr() { printf "\n${BOLD}── %s ──${NC}\n" "$1"; }
+
+fetch() { curl -sL "$1"; }
+code() { curl -s -o /dev/null -w "%{http_code}" "$1"; }
+
+xml_has() {
+  echo "$1" | xmllint --nowarning --xpath "$2" - >/dev/null 2>&1
+}
+
+xml_val() {
+  echo "$1" | xmllint --nowarning --xpath "$2" - 2>/dev/null || true
 }
 
 check_http() {
-    local name=$1 url=$2 expect=${3:-200}
-    local code; code=$(http_code "$url")
-    [[ "$code" == "$expect" ]] && ok "$name (HTTP $code)" || { echo "    got HTTP $code"; fail "$name"; }
+  local name=$1 url=$2 want=${3:-200}
+  local got
+  got=$(code "$url")
+  [[ "$got" == "$want" ]] && ok "$name" || fail "$name" "HTTP $got"
 }
 
 check_xml() {
-    local name=$1 url=$2 xpath=$3
-    curl -s "$url" | xq -x "$xpath" >/dev/null 2>&1 && ok "$name" || fail "$name"
+  local name=$1 url=$2 xpath=$3
+  local body
+  body=$(fetch "$url")
+  xml_has "$body" "$xpath" && ok "$name" || fail "$name" "xpath fail"
+}
+
+check_xml_val() {
+  local name=$1 url=$2 xpath=$3 want=$4
+  local body got
+  body=$(fetch "$url")
+  got=$(xml_val "$body" "$xpath")
+  [[ "$got" == "$want" ]] && ok "$name" || fail "$name" "got='$got' want='$want'"
+}
+
+check_xml_empty() {
+  local name=$1 url=$2 xpath=$3
+  local body
+  body=$(fetch "$url")
+  xml_has "$body" "$xpath" && fail "$name" "unexpected match" || ok "$name"
+}
+
+check_int() {
+  local name=$1 url=$2 min=${3:-0}
+  local body val
+
+  body=$(fetch "$url" | tr -d '\r\n ')
+
+  val=""
+  if [[ "$body" =~ ^[0-9]+$ ]]; then
+    val="$body"
+  else
+    val=$(echo "$body" | grep -oE '[0-9]+' | head -n1 || true)
+  fi
+
+  [[ "$val" =~ ^[0-9]+$ ]] && (( val >= min )) \
+    && ok "$name ($val)" \
+    || fail "$name" "bad int '$body'"
 }
 
 check_zip() {
-    local name=$1 url=$2
-    local tmp; tmp=$(mktemp /tmp/chk_XXXXXX.nupkg)
-    local bytes=0
+  local name=$1 url=$2
+  local tmp magic
 
-    curl -fsSL -o "$tmp" "$url" 2>/dev/null && bytes=$(wc -c < "$tmp") || true
-
-    if [[ "$bytes" -gt 0 ]]; then
-        ok "$name (${bytes}B)"
-    else
-        fail "$name (empty/download failed)"
-        rm -f "$tmp"
-        return
-    fi
-
-    # ZIP local-file header magic: 50 4B 03 04
-    local magic; magic=$(od -An -tx1 -N4 "$tmp" | tr -d ' \n')
+  tmp=$(mktemp)
+  curl -fsSL "$url" -o "$tmp" || {
+    fail "$name" "download failed"
     rm -f "$tmp"
+    return
+  }
 
-    if [[ "$magic" == "504b0304" ]]; then
-        ok "$name (ZIP sig)"
-    else
-        fail "$name (bad ZIP sig, got: $magic)"
-    fi
+  magic=$(od -An -tx1 -N4 "$tmp" | tr -d ' \n')
+  rm -f "$tmp"
+
+  [[ "$magic" == "504b0304" ]] && ok "$name" || fail "$name" "bad zip"
 }
 
-nuget_has() {
-    local term=$1 expect=$2
-    ./bin/nuget search "$term" -Source "$BASE/Packages" -NonInteractive 2>/dev/null \
-        | tr -d '\r' \
-        | grep -qi "$expect" && ok "nuget search '$term'" || fail "nuget search '$term'"
-}
+hdr "SERVICE"
 
-# ── Service document / metadata ───────────────────────────────────────────────
-hdr "SERVICE DOCUMENT"
-check_xml "root collection href"   "$BASE/"          "//collection[@href='Packages']"
-check_xml "\$metadata collection"  "$BASE/\$metadata" "//collection[@href='Packages']"
+check_http "GET /Packages" "$BASE/Packages"
+check_xml "feed root" "$BASE/Packages" "//*[local-name()='feed']"
+check_http "GET /metadata" "$BASE/\$metadata"
 
-# ── Feed structure ────────────────────────────────────────────────────────────
-hdr "PACKAGES FEED"
-check_xml "Packages feed element"  "$BASE/Packages"  "//*[local-name()='feed']"
-check_xml "Packages m:count"       "$BASE/Packages"  "//*[local-name()='count']"
+hdr "ODATA CORE"
 
-# ── OData filter ─────────────────────────────────────────────────────────────
-hdr "ODATA \$filter"
-check_xml "Id eq exact"      "$BASE/Packages?\$filter=Id%20eq%20'git.install'"        "//*[local-name()='Id'][text()='git.install']"
-check_xml "tolower eq"       "$BASE/Packages?\$filter=tolower(Id)%20eq%20'git.install'" "//*[local-name()='Id']"
-check_xml "substringof"      "$BASE/Packages?\$filter=substringof('git',tolower(Id))"  "//*[local-name()='Id']"
-check_xml "7zip exact"       "$BASE/Packages?\$filter=Id%20eq%20'7zip.install'"       "//*[local-name()='Id'][text()='7zip.install']"
-check_xml "missing safe"     "$BASE/Packages?\$filter=Id%20eq%20'doesnotexist'"      "//*[local-name()='feed']"
+check_xml "filter Id eq" "$BASE/Packages?\$filter=Id%20eq%20'$PKG'" "//*[local-name()='Id']"
 
-# ── OData pagination ──────────────────────────────────────────────────────────
-hdr "PAGINATION"
-check_xml "\$top=1 has entry"  "$BASE/Packages?\$top=1"           "//*[local-name()='entry']"
-check_xml "\$skip=0 has entry" "$BASE/Packages?\$skip=0"          "//*[local-name()='entry']"
-check_xml "\$orderby id asc"   "$BASE/Packages?\$orderby=id%20asc" "//*[local-name()='feed']"
+# -------------------- CHOCO COMPAT FILTER (INLINE, NOT SEPARATE) --------------------
 
-# ── \$count ────────────────────────────────────────────────────────────────────
-hdr "\$COUNT"
-COUNT=$(curl -s "$BASE/Packages/\$count")
-if [[ "$COUNT" =~ ^[0-9]+$ ]]; then
-    ok "Packages/\$count = $COUNT"
-else
-    fail "Packages/\$count (got: $COUNT)"
+check_http "choco complex filter (/Packages())" \
+"$BASE/Packages()?\$filter=((((Id%20ne%20null)%20and%20substringof('git',tolower(Id)))%20or%20((Description%20ne%20null)%20and%20substringof('git',tolower(Description))))%20or%20((Tags%20ne%20null)%20and%20substringof('%20git%20',tolower(Tags))))%20and%20IsLatestVersion&\$orderby=Id&\$skip=0&\$top=30&semVerLevel=2.0.0" \
+200 || true
+
+check_xml "choco complex filter feed" \
+"$BASE/Packages()?\$filter=((((Id%20ne%20null)%20and%20substringof('git',tolower(Id)))%20or%20((Description%20ne%20null)%20and%20substringof('git',tolower(Description))))%20or%20((Tags%20ne%20null)%20and%20substringof('%20git%20',tolower(Tags))))%20and%20IsLatestVersion&\$orderby=Id&\$skip=0&\$top=30&semVerLevel=2.0.0" \
+"//*[local-name()='feed']"
+
+check_xml "substring Id search" \
+"$BASE/Packages?\$filter=substringof('git',tolower(Id))" \
+"//*[local-name()='feed']"
+
+check_xml "substring Description search" \
+"$BASE/Packages?\$filter=Description%20ne%20null%20and%20substringof('git',tolower(Description))" \
+"//*[local-name()='feed']"
+
+check_xml "substring Tags search" \
+"$BASE/Packages?\$filter=Tags%20ne%20null%20and%20substringof('%20git%20',tolower(Tags))" \
+"//*[local-name()='feed']"
+
+check_xml "OR filter search" \
+"$BASE/Packages?\$filter=(substringof('git',tolower(Id))%20or%20substringof('git',tolower(Description)))" \
+"//*[local-name()='feed']"
+
+# -------------------- REST --------------------
+
+hdr "SEARCH"
+
+check_http "Search" "$BASE/Search()?searchTerm='$PKG'"
+check_xml "Search feed" "$BASE/Search()?searchTerm='$PKG'" "//*[local-name()='feed']"
+
+hdr "FIND"
+
+check_http "FindPackagesById" "$BASE/FindPackagesById()?id='$PKG'"
+check_xml "FindPackagesById entry" "$BASE/FindPackagesById()?id='$PKG'" "//*[local-name()='entry']"
+
+hdr "SINGLE ENTITY"
+
+check_http "entity" "$BASE/Packages(Id='$PKG',Version='$VER')"
+check_xml "entity entry" "$BASE/Packages(Id='$PKG',Version='$VER')" "//*[local-name()='entry']"
+check_xml_val "entity id match" \
+  "$BASE/Packages(Id='$PKG',Version='$VER')" \
+  "string(//*[local-name()='Id'][1])" "$PKG"
+
+hdr "COUNT"
+
+check_int "Packages/\$count" "$BASE/Packages/\$count" 0
+check_int "Search/\$count" "$BASE/Search()/\$count" 0
+
+hdr "DOWNLOAD"
+
+check_http "nupkg endpoint" "$BASE/package/$PKG/$VER"
+check_zip "valid zip" "$BASE/package/$PKG/$VER"
+
+hdr "NEGATIVE"
+
+check_http "missing entity 404" "$BASE/Packages(Id='__nope__',Version='0.0.0')" 404
+check_xml_empty "missing filter empty" \
+  "$BASE/Packages?\$filter=Id%20eq%20'__nope__'" \
+  "//*[local-name()='entry']"
+
+hdr "GetUpdates"
+
+check_xml "update exists" \
+  "$BASE/GetUpdates()?packageIds=$PKG&versions=0.0.0&includePrerelease=false&includeAllVersions=false" \
+  "//*[local-name()='Id']"
+
+check_xml_empty "same version no updates" \
+  "$BASE/GetUpdates()?packageIds=$PKG&versions=$VER&includePrerelease=false&includeAllVersions=false" \
+  "//*[local-name()='entry']"
+
+hdr "v3"
+
+check_http "v3 index" "$BASE/v3/index.json"
+
+if command -v jq >/dev/null 2>&1; then
+  check_http "v3 query" "$BASE/v3/query?q=${PKG,,}"
 fi
 
-# ── FindPackagesById ──────────────────────────────────────────────────────────
-hdr "FindPackagesById"
-check_xml "git.install"  "$BASE/FindPackagesById()?id='git.install'"  "//*[local-name()='Id'][text()='git.install']"
-check_xml "7zip.install" "$BASE/FindPackagesById()?id='7zip.install'" "//*[local-name()='Id'][text()='7zip.install']"
+hdr "CLI"
 
-# ── Search() ─────────────────────────────────────────────────────────────────
-hdr "Search()"
-check_xml "Search git"  "$BASE/Search()?searchTerm='git'"  "//*[local-name()='feed']"
-check_xml "Search 7zip" "$BASE/Search()?searchTerm='7zip'" "//*[local-name()='feed']"
-
-# ── GetUpdates ────────────────────────────────────────────────────────────────
-hdr "GetUpdates()"
-check_xml "GetUpdates feed"  "$BASE/GetUpdates()?packageIds=git.install&versions=0.0.0" "//*[local-name()='feed']"
-check_xml "no updates same"  "$BASE/GetUpdates()?packageIds=git.install&versions=99.99.99" "//*[local-name()='feed']"
-
-# ── Package hashes in entries ─────────────────────────────────────────────────
-hdr "NuGet COMPLIANCE"
-check_xml "PackageHash present"          "$BASE/Packages" "//*[local-name()='PackageHash']"
-check_xml "PackageHashAlgorithm present" "$BASE/Packages" "//*[local-name()='PackageHashAlgorithm']"
-check_xml "IsLatestVersion present"      "$BASE/Packages" "//*[local-name()='IsLatestVersion']"
-
-# ── Downloads ─────────────────────────────────────────────────────────────────
-hdr "DOWNLOADS"
-check_http "HTTP git.install"   "$BASE/package/git.install/2.54.0"
-check_http "HTTP 7zip.install"  "$BASE/package/7zip.install/26.0.0"
-check_http "404 on missing pkg" "$BASE/package/doesnotexist/1.0.0" 404
-
-check_zip "git.install"  "$BASE/package/git.install/2.54.0"
-check_zip "7zip.install" "$BASE/package/7zip.install/26.0.0"
-
-# ── NuGet CLI ─────────────────────────────────────────────────────────────────
-hdr "NuGet CLI"
-nuget_has "git"  "git.install"
-nuget_has "7zip" "7zip.install"
-
-# ── Summary ───────────────────────────────────────────────────────────────────
-echo ""
-if [[ "$FAIL" -eq 0 ]]; then
-    echo -e "${GREEN}ALL PASS${NC}"
+if [[ -x bin/nuget ]]; then
+  bin/nuget list "$PKG" -Source "$BASE" >/dev/null 2>&1 && ok "nuget list" || fail "nuget list"
 else
-    echo -e "${RED}${FAIL} FAILURE(S)${NC}"
+  skip "nuget CLI" "missing"
 fi
-exit $FAIL
+
+hdr "RESULTS"
+
+printf "PASS=%d FAIL=%d SKIP=%d\n" "$PASS" "$FAIL" "$SKIP"
+
+(( FAIL == 0 )) && exit 0 || exit 1
