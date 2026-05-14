@@ -507,13 +507,13 @@ function serve_single_entity(string $id, string $version): void
     $enriched = compute_flags(enrich($pkg), $all);
     header('Content-Type: application/atom+xml; charset=utf-8');
     echo <<<XML
-<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <entry xmlns="http://www.w3.org/2005/Atom"
        xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
        xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
        xml:base="{$b}/">
 XML;
-    echo "\n" . package_entry($enriched) . "\n</entry>";
+    echo "\n" . package_entry($enriched, false) . "\n</entry>";
 }
 
 function serve_packages(string $fixedId = ''): void
@@ -1010,7 +1010,7 @@ XML;
 function feed_close(): void
 {echo "\n</feed>";}
 
-function package_entry(array $pkg): string
+function package_entry(array $pkg, bool $wrap = true): string
 {
     $b       = base_url();
     $id      = htmlspecialchars($pkg['id'], ENT_XML1);
@@ -1040,8 +1040,7 @@ function package_entry(array $pkg): string
     $hashAlg = htmlspecialchars($pkg['hashAlgorithm'] ?? 'SHA512', ENT_XML1);
     $dlUrl   = "{$b}/package/{$id}/{$ver}";
 
-    return <<<XML
-  <entry>
+    $body = <<<XML
     <id>{$b}/Packages(Id='{$id}',Version='{$ver}')</id>
     <title type="text">{$title}</title>
     <summary type="text">{$summary}</summary>
@@ -1086,10 +1085,12 @@ function package_entry(array $pkg): string
       <d:LicenseNames></d:LicenseNames>
       <d:LicenseReportUrl></d:LicenseReportUrl>
     </m:properties>
-  </entry>
 XML;
-}
 
+    return $wrap
+        ? "  <entry>\n{$body}\n  </entry>"
+        : $body;
+}
 /** Strip build metadata, normalize 3-part version for NuGet NormalizedVersion field. */
 function normalize_version(string $ver): string
 {
