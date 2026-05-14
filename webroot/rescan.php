@@ -8,7 +8,7 @@
 
 declare (strict_types = 1);
 
-define("PACKAGES_DIR", realpath(__DIR__ . "/packages") ?: (__DIR__ . "/packages"));
+define("PACKAGES_DIR", realpath(__DIR__ . "/packages") ?: __DIR__ . "/packages");
 define("INDEX_FILE", PACKAGES_DIR . "/index.json");
 
 $isCli = PHP_SAPI === "cli";
@@ -46,13 +46,19 @@ foreach (glob(PACKAGES_DIR . "/*.nupkg") ?: [] as $file) {
     out("OK    " . $pkg["id"] . " " . $pkg["version"]);
 }
 
-usort($index, fn($a, $b) => strcmp(
-    strtolower($a["id"]) . $a["version"],
-    strtolower($b["id"]) . $b["version"]
-));
+usort(
+    $index,
+    fn($a, $b) => strcmp(
+        strtolower($a["id"]) . $a["version"],
+        strtolower($b["id"]) . $b["version"],
+    ),
+);
 
 $tmp = INDEX_FILE . ".tmp." . getmypid();
-if (file_put_contents($tmp, json_encode($index, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) === false) {
+if (
+    file_put_contents($tmp, json_encode($index, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) ===
+    false
+) {
     err("Cannot write index to " . $tmp);
     exit(1);
 }
@@ -103,17 +109,19 @@ function parse_nupkg(string $filepath): ?array
     return [
         "id"                       => $id,
         "version"                  => $version,
-        "title"                    => (string) ($m->title ?? $m->id ?? $id),
-        "summary"                  => (string) ($m->summary ?? $m->description ?? ""),
+        "title"                    => (string) ($m->title ?? ($m->id ?? $id)),
+        "summary"                  => (string) ($m->summary ?? ($m->description ?? "")),
         "description"              => (string) ($m->description ?? ""),
         "authors"                  => (string) ($m->authors ?? ""),
-        "owners"                   => (string) ($m->owners ?? $m->authors ?? ""),
+        "owners"                   => (string) ($m->owners ?? ($m->authors ?? "")),
         "tags"                     => (string) ($m->tags ?? ""),
         "projectUrl"               => (string) ($m->projectUrl ?? ""),
         "licenseUrl"               => (string) ($m->licenseUrl ?? ""),
         "iconUrl"                  => (string) ($m->iconUrl ?? ""),
         "releaseNotes"             => (string) ($m->releaseNotes ?? ""),
-        "requireLicenseAcceptance" => strtolower((string) ($m->requireLicenseAcceptance ?? "false")),
+        "requireLicenseAcceptance" => strtolower(
+            (string) ($m->requireLicenseAcceptance ?? "false"),
+        ),
         "dependencies"             => parse_dependencies($m->dependencies ?? null),
         "published"                => date("c", (int) filemtime($filepath)),
         "size"                     => (int) filesize($filepath),
